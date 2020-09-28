@@ -1,0 +1,2489 @@
+
+---------- Forwarded message ---------
+From: alun brain <alun.brain@googlemail.com>
+Date: Fri, 3 May 2019, 08:11
+Subject: sas binning code
+To: alun brain <alun.brain@googlemail.com>
+
+
+/******************************************************************************************************************************************
+
+Authors Jakub Deka 
+Richard Parfitt 
+Alun brain    
+
+Date 2016-08-25
+Description Suite of macros for automated binner which will iterate
+over a variable and combine ainme
+djacent bins if significance
+criteria is not met - can also be run for multiple variables via a control table
+
+chiMergeControl
+chiMergeBinner
+chiMergeBinner_baseDataset
+chiMergeBinner_step
+chiMergeBinner_merge
+chiMergeBinner_caseText
+chiMergeBinner_flagText
+chiMergeBinner_logResults * NOTE: No longer used, replaced by
+chiMergeBinner_logResults_db
+chiMergeBinner_logResults_db
+monotonicTest * NOTE: Removed as replaced by separate program
+
+
+************   INSTRUCTIONS
+
+1) CHECK THE LIBNAME HAS BEEN SET CORRECTLY
+2) RUN IT ALL
+3) NO OUTPUT WILL BE CREATED FROM THIS MACRO, AS IT IS JUST A MACRO
+AND NOTHING ELSE
+
+
+******************************************************************************************************************************************/
+
+/* chiMergeControl - for multi variable runs - call once with a
+control dataset and will call chiMergeBinner once per row
+Usage dsControl tablisBad_d8p24_balGt100e with one row per variable to be binned
+reset specify whether or not to run unfinished rows of the control (0)
+or the whole table (1) (default=1)
+initialGroups number of dumb bins to commence automated process from
+desiredSig significance threshold above which binning ceases (default=0.01)
+desiredBins number of bins to force continue until - 0 for stop at
+significance failure (default=0)
+aggrCopyLib library to save final binned value datasets in
+dsCaseLog table to log run info too, including generated CASE
+statement and result of monotonic test
+dsExceptions dataset containing values not to be merged with others
+*/
+
+
+
+libname inmem 'C:\inmem';
+
+
+%macro chiMergeControl(dsControl=, reset=1, df=, initialGroups=,
+desiredSig=, desiredBins=, aggrCopyLib=, dsCaseLog=, dsExceptions=);
+%if &reset = 1 %then %do;
+* Reset run flag ;
+data &dsControl;
+set &dsControl;
+runFlg = 0;
+run;
+%end;
+
+* Loop through the rows of the control table;
+proc sql noprint;
+select count(*) into :nRuns from &dsControl.;
+quit;
+%do i = 1 %to &nRuns.;
+data _null_;
+set &dsControl. (firstobs=&i. obs=&i.);
+call symput('id',id);
+call symput('dsInput',table);
+call symput('varname',var);
+call symput('targetVar',targetVar);
+call symput('runFlg',put(runFlg,1.));
+run;
+
+%put &i. - &dsInput..&varname. for &targetVar;
+
+%if &runFlg = 1 %then %goto loop;
+%chiMergeBinner(id=&id.,
+varname=&varname.,
+targetVar=&targetVar.,
+df=&df.,
+dsInput=&dsInput.,
+initialGroups=&initialGroups.,
+desiredSig=&desiredSig.,
+desiredBins=&desiredBins.,
+aggrCopyLib=&aggrCopyLib.,
+dsCaseLog=&dsCaseLog.,
+dsExceptions=&dsExceptions.);
+
+* Update run flag on success;
+%if &syserr = 0 and %sysfunc(exist(&aggrCopyLib..&varname.)) = 1 %then %do;
+data &dsControl;
+set &dsControl;
+if _n_ = &i. then runFlg = 1;
+run;
+%end;
+
+%loop:
+%end;
+%mend chiMergeControl;
+
+/* chiMergeBinner - the outer wrapper, call once per variable to be binned;
+Usage id primary key for input data
+varname column to be binned
+targetVar column to be analysed for similarity across bins
+df
+dsInput library and table name of input data
+initialGroups number of dumb bins to commence automated process from
+(default=100)
+desiredSig significance threshold above which binning ceases (default=0.01)
+desiredBins number of bins to force continue until - 0 for stop at
+significance failure (default=0)
+aggrCopyLib library to save final binned value dataset in
+dsCaseLog table to log run info too, including generated CASE
+statement and result of monotonic test
+dsExceptions dataset containing values not to be merged with others
+minVarVal minimum value for varname to be binned
+maxVarVal maximum value for varname to be binned
+*/
+%macro chiMergeBinner2(
+id =
+, varname =
+, targetVar =
+, df =
+, dsInput =
+, initialGroups = 50
+, desiredSig = 0.01
+, desiredBins = 0
+, aggrCopyLib =
+, dsCaseLog =
+, dsExceptions =
+, projectNickname =
+, variableNickname =
+, iterNickname =
+, minVarVal = NULL
+, maxVarVal = NULL
+);
+* Set up in mem library;
+
+* Handle character variables differently;
+%let dsid = %sysfunc(open(&dsInput.));
+%if %sysfunc(vartype(&dsid.,%sysfunc(varnum(&dsid.,&varname.)))) ne N %then %do;
+%put &varname. is not numeric;
+* Create dummy dataset;
+proc sql noprint;
+create table inmem.aggr as
+select distinct &varname. as minVal,
+&varname. as maxVal
+from &dsInput.;
+quit;
+
+
+* Jump to text generators;
+%let rc = %sysfunc(close(&dsid.));
+%goto charJump;
+%end;
+
+%let rc = %sysfunc(close(&dsid.));
+
+* Create iteration counter;
+%let iter = 1;
+
+* Extract the data and run initial binning;
+%chiMergeBinner_baseDataset(
+id = &id.
+, varname = &varname.
+, targetVar = &targetVar.
+, dsInput = &dsInput.
+, initialGroups = &initialGroups.
+, minVarVal = &minVarVal.
+, maxVarVal = &maxVarVal.
+);
+
+* Initial execution of the step;
+%chiMergeBinner_step;
+proc sql noprint;
+select this_r, pValue into :mergeBucket, :p from inmem.step where row = 1
+;
+select count(*) into :stepC from inmem.step
+;
+quit;
+
+%do %while (&mergeBucket. ne . and &p. ne . and (%sysevalf(&p. >
+&desiredSig.) or (%eval(&stepC.+1) > &desiredBins. and &desiredBins. >
+0)) and &iter. <= &initialGroups. and &stepC. > 0);
+
+%chiMergeBinner_merge(&mergeBucket.);
+
+%chiMergeBinner_step;
+
+proc sql noprint;
+select this_r, pValue into :mergeBucket, :p from inmem.step where row = 1
+;
+select count(*) into :stepC from inmem.step
+;
+quit;
+
+%let iter = %eval(&iter. + 1);
+%end;
+
+* Append response data to the inmem.aggr;
+proc sql undo_policy=none;
+create table inmem.aggr as
+select *
+, resp/n as respRate format percent8.1
+from inmem.aggr
+;
+quit;
+
+* pick rank for each exception value;
+%if &dsExceptions ne  %then %do;
+* set H and L values;
+proc sql noprint;
+select max(r) into :maxR from inmem.aggr where respRate=(select
+max(respRate) from inmem.aggr);
+select min(r) into :minR from inmem.aggr where respRate=(select
+min(respRate) from inmem.aggr);
+quit;
+
+* append each exception value;
+data inmem.aggr;
+set inmem.aggr
+&dsExceptions. (where=(var="&varname." and table="&dsInput." and
+targetVar="&targetVar."));
+if band = 'H' then r = &maxR.;
+else if band = 'L' then r = &minR.;
+if value ne . then minVal = value;
+if value ne . then maxVal = value;
+keep r minVal maxVal n resp respRate;
+run;
+
+
+* resort;
+proc sort data=inmem.aggr;
+by minVal maxVal;
+run;
+
+
+%end;
+
+* Test for monoticity;
+%monotonicTest(data=inmem.aggr, var=respRate);
+
+
+       * adding nulls as seem to be missing - ab;
+proc sql;
+   create table nully  as
+   select "&varname." as vari format $32., 0 as r, . as minval, . as maxval,
+                 sum(1) as n,  sum(&targetVar.) as resp,
+sum(&targetVar.) / sum(1) as respRate  format percent8.1
+   from build
+           where &varname. = .;
+        quit;
+
+data inmem.aggr;
+    set inmem.aggr
+     nully;
+if n=. then n=0;
+if resp=. then resp=0;
+if respRate=. then respRate=0;
+  if r=0 then numnull=n;
+     else numnull=0;
+  run;
+
+
+   data &varname. (drop=aminval amaxval);
+   format vari $32. minval maxval  $100. ;
+     set  inmem.aggr(rename=(minval=aminval maxval=amaxval));
+minval = input(put(aminval, best12.), $12.);
+maxval = input(put(amaxval, best12.), $12.);
+if minval= ' ' then minval='null';
+if maxval= ' ' then maxval='null';
+vari = "&varname.";
+if n>0;
+monotest = "&monoTest.";
+monoScore = "&monoScore.";
+monoDistance = "&monoDistance.";
+  run;
+
+
+  proc summary data= &varname. nway;
+    class vari;
+var n resp;
+output out=tmp1(drop=_type_ _freq_) sum=;
+ run;
+
+ data tmp2;
+   merge &varname.
+         tmp1(rename=(n=totn resp=totresp));
+by vari;
+
+  WOE = log(( resp/ totresp) / ((n-resp) / (totn -totresp)));
+  IVContribution = ((resp / totresp) - ((n-resp) / (totn - totresp))  ) * WOE;
+run;
+
+data tmp3(drop=cfdd);
+  format vari $32.;
+  set tmp2(rename=(vari=cfdd));
+  vari = put(cfdd, $32.);
+run;
+
+  proc append data=tmp3 base=allres force;
+  run;
+
+
+%charJump:
+
+
+%let dsid = %sysfunc(open(&dsInput.));
+%if %sysfunc(vartype(&dsid.,%sysfunc(varnum(&dsid.,&varname.)))) ne N %then %do;
+
+
+
+  proc summary data=build nway;
+    class &varname. ;
+    var &targetVar.;
+    output out= tmp(drop=_type_) sum=;
+  run;
+
+  data inmem.aggr;
+    set tmp(rename=(_freq_=n));
+    r+1;
+   respRate = &targetVar. / n;
+  run;
+
+proc sql noprint;
+select max(r) into :lastGroup from inmem.aggr;
+select respRate format best9. into :firstRr from inmem.aggr where r = 1;
+select respRate format best9. into :lastRr from inmem.aggr where r =
+&lastGroup.;
+quit;
+
+          proc sort data=inmem.aggr;
+           by respRate;
+       run;
+
+    data inmem.aggr(drop=var);
+      format &varname. $100.;
+      set inmem.aggr(rename=(&varname. = var));
+      r = _n_;
+      resp=&targetVar.;
+     &varname. = quote(compress(var));
+   run;
+
+
+* Initial execution of the step;
+%chiMergeBinnerchar_step;
+proc sql noprint;
+select this_r, pValue into :mergeBucket, :p from inmem.step where row = 1
+;
+select count(*) into :stepC from inmem.step
+;
+quit;
+
+* Create iteration counter;
+%let iter = 1;
+      %do %while (&mergeBucket. ne . and &p. ne . and (%sysevalf(&p. >
+&desiredSig.) or (%eval(&stepC.+1) > &desiredBins. and &desiredBins. >
+0)) and &iter. <= &initialGroups. and &stepC. > 0);
+               %chiMergeBinner_mergechar(&mergeBucket.);
+               %chiMergeBinnerchar_step;
+
+
+
+      proc sql noprint;
+select this_r, pValue into :mergeBucket, :p from inmem.step where row = 1
+;
+select count(*) into :stepC from inmem.step
+;
+quit;
+  %let iter = %eval(&iter. + 1);
+%end;
+  /** sorting out the data for future use  **/
+      data inmem.aggr(drop=&varname.);
+  format vari $32.;
+    set inmem.aggr;
+vari ="&varname.";
+minval = &varname.;
+         maxval = &varname.;
+resprate = resp / n;
+       run;
+
+  proc sort;
+    by resprate;
+  run;
+* Test for monoticity;
+%monotonicTest(data=inmem.aggr, var=respRate);
+
+
+   /** adding in nulls  **/
+proc sql;
+   create table nully  as
+   select "&varname." as vari format $32., 0 as r, 'null' as minval,
+'null' as maxval,
+                 sum(1) as n,  sum(&targetVar.) as resp,
+sum(&targetVar.) / sum(1) as respRate  format percent8.1
+   from build
+           where &varname. = ' ';
+        quit;
+
+data inmem.aggr;
+    set inmem.aggr
+     nully;
+if n=. then n=0;
+if resp=. then resp=0;
+if respRate=. then respRate=0;
+  if r=0 then numnull=n;
+     else numnull=0;
+  run;
+
+data &varname.;
+format vari  $32.;
+  set  inmem.aggr;
+  vari = "&varname.";
+  if n>0;
+  monotest = "&monoTest.";
+monoScore = "&monoScore.";
+monoDistance = "&monoDistance.";
+run;
+
+
+  proc summary data= &varname. nway;
+    class vari;
+var n resp;
+output out=tmp1(drop=_type_ _freq_) sum=;
+ run;
+
+ data tmp2;
+   merge &varname.
+         tmp1(rename=(n=totn resp=totresp));
+by vari;
+
+  WOE = log(( resp/ totresp) / ((n-resp) / (totn -totresp)));
+  IVContribution = ((resp / totresp) - ((n-resp) / (totn - totresp))  ) * WOE;
+run;
+
+
+
+data tmp3(drop=cfdd);
+  format vari $32.;
+  set tmp2(rename=(vari=cfdd));
+  vari = put(cfdd, $32.);
+run;
+
+  proc append data=tmp3 base=allres force;
+  run;
+
+
+%end;
+
+
+  %let rc = %sysfunc(close(&dsid.));
+
+
+
+* Generate case text;
+  %chiMergeBinner_caseText(&varname.);
+
+* Generate flag text;
+
+%chiMergeBinner_flagText(&varname.);
+
+* Log the results;
+%chiMergeBinner_logResults_db (
+id = &id.
+, varname = &varname.
+, targetVar = &targetVar.
+, df = &df.
+, dsInput = &dsInput.
+, initialGroups = &initialGroups.
+, desiredSig = &desiredSig.
+, desiredGroups = &desiredBins.
+, caseStatement = %superq(caseText)
+, flagStatement = %superq(flagText)
+, logAggrData = 1
+, aggrCopyLib = &aggrCopyLib.
+, monoTest = &monoTest.
+, projectNickname = &projectNickname.
+, variableNickname = &variableNickname.
+, iterNickname = &iterNickname.
+, minVarVal = &minVarVal.
+, maxVarVal = &maxVarVal.
+);
+
+* Clean up;
+proc sql;
+drop table inmem.step;
+drop table inmem.x;
+drop table inmem.x2;
+drop table inmem.aggr;
+drop table &varname;
+quit;
+
+%symdel caseText flagText monoTest / nowarn;
+
+
+
+proc sort data= allres nodupkey;
+  by vari r;
+run;
+
+proc sql;
+  create table maxr as
+  select  vari, max(r) as maxr, sum(ivcontribution) as iv
+  from allres
+  group by vari
+  order by vari;
+quit;
+
+data allres1;
+  merge allres
+        maxr;
+by vari;
+  if maxr>=30 or (maxr<=1 and iv<0.01) or iv=0 then delete;
+run;
+
+data inmem.bin_reject(keep=vari reason );
+  format vari $32. reason $250.;
+  set maxr(rename=(vari=xcv));
+  vari = put(xcv, $32.);
+  if maxr>=30 or (maxr<=1 and iv<0.01) or iv=0   ;
+  if maxr>=30 then reason = 'variable contains over 30 bins after
+binning (excluding null)';
+  else if maxr=1 then reason = 'variable contains just 1 bin after
+binning (excluding null) and an IV of '||compress(round(iv, 0.001));
+  else if iv=0 then reason = 'variable has no predictive power, IV =
+'||compress(round(iv, 0.001));
+run;
+
+
+data inmem.cordata;
+  set allres1;
+run;
+%mend chiMergeBinner2;
+
+
+%macro chiMergeBinner_baseDataset (id, varname, targetVar, dsInput,
+initialGroups, minVarVal=NULL, maxVarVal=NULL);
+proc sql;
+create table inmem.x as
+select i.&id., i.&varName., i.&targetVar.
+%if &dsExceptions. ne  %then %do;
+, e.band
+%end;
+%else %do;
+, . as band
+%end;
+from &dsInput. as i
+%if &dsExceptions. ne  %then %do;
+left join &dsExceptions. as e on i.&varname. = e.value and e.table =
+"&dsInput." and e.targetVar = "&targetVar."
+%end;
+where i.&varName. is not null
+and i.&targetVar. is not null
+%if &minVarVal. ne NULL %then %do;
+and i.&varName. >= &minVarVal.
+%end;
+%if &maxVarVal. ne NULL %then %do;
+and i.&varName. <= &maxVarVal.
+%end;
+;
+quit;
+
+* First coarse class the resulting dataset, excluding exceptions values;
+proc rank data=inmem.x(where=(band is null)) groups=&initialGroups.
+out=inmem.x2 ties=low;
+ranks r;
+var &varName.;
+run;
+
+* Aggregate the data by initial rank;
+proc sql noprint;
+create table inmem.aggr as
+select r, min(&varName.) as minVal, max(&varName.) as maxVal, count(*)
+as n, sum(&targetVar.) as resp
+from inmem.x2
+group by r
+order by r
+;
+quit;
+
+data inmem.aggr;
+set inmem.aggr;
+r = _n_;
+run;
+%mend chiMergeBinner_baseDataset;
+
+%macro chiMergeBinner_step;
+* Calculate chi squared statistics and determine if result is significant;
+proc sql;
+create table inmem.step as
+select
+*
+, ((this_resp - this_n*expectedRate)**2)/(this_n*expectedRate) +
+((next_resp - next_n*expectedRate)**2)/(next_n*expectedRate) as
+chiStatistics
+, 1 - probchi(calculated chiStatistics, &df.) as pValue
+from (
+select this.r as this_r
+, this.minVal as this_minVal
+, this.maxVal as this_maxVal
+, this.n as this_n
+, this.resp as this_resp
+, this.resp/this.n as this_respRate
+, next.r as next_r
+, next.minVal as next_minVal
+, next.maxVal as next_maxVal
+, next.n as next_n
+, next.resp as next_resp
+, next.resp/next.n as next_respRate
+
+, (this.resp+next.resp)/(this.n+next.n) as expectedRate
+from inmem.aggr this
+inner join inmem.aggr next on this.r+1 = next.r
+) t
+order by chiStatistics
+;
+quit;
+
+data inmem.step;
+set inmem.step;
+row = _n_;
+run;
+%mend chiMergeBinner_step;
+
+%macro chiMergeBinner_merge(mergeBucket);
+* Combine the data;
+proc sql undo_policy=none;
+create table inmem.aggr as
+select
+case when a.r <= &mergeBucket.+1 then a.r else a.r-1 end as r
+, a.minVal
+, case when a.r = &mergeBucket. then next.maxVal else a.maxVal end as maxVal
+, case when a.r = &mergeBucket. then a.n + next.n else a.n end as n
+, case when a.r = &mergeBucket. then a.resp + next.resp else a.resp end as resp
+from inmem.aggr a
+left outer join inmem.aggr next on a.r + 1 = next.r
+where a.r <> &mergeBucket.+1
+;
+quit;
+%mend chiMergeBinner_merge;
+
+%macro chiMergeBinner_caseText(varname);
+
+
+proc sql noprint;
+select max(r) into :lastGroup from inmem.aggr;
+select respRate format best9. into :firstRr from inmem.aggr where r = 1;
+select respRate format best9. into :lastRr from inmem.aggr where r =
+&lastGroup.;
+quit;
+
+%global caseText;
+
+
+
+%let dsid = %sysfunc(open(&dsInput.));
+%if %sysfunc(vartype(&dsid.,%sysfunc(varnum(&dsid.,&varname.)))) ne N %then %do;
+
+
+
+data _null_;
+set inmem.aggr end=last;
+       if n_ = 1 then do;
+    call symput("caseText", ", CASE WHEN &varname. in (" ||
+compress(maxVal) || ") THEN " || compress(put(r,8.)) || " ");
+end;
+    else if last then do;
+call symput("caseText", symget("caseText") || "WHEN &varname. in (" ||
+compress(maxVal)  || ") THEN " || compress(put(r,8.)) || " ");
+if (&firstRr. > &lastRr.) then do;
+call symput("caseText", symget("caseText") || "ELSE 1 END");
+end;
+else do;
+call symput("caseText", symget("caseText") || "ELSE " ||
+compress("&lastGroup.") || " END ");
+end;
+v = "z_" || compress("&varname.") || "_BLID¿©§Æ®Æ§©¿BLID";
+call symput("caseText", symget("caseText") || " as " || v);
+end;
+else do;
+call symput("caseText", symget("caseText") || "WHEN &varname. in (" ||
+compress(maxVal) || " THEN " || compress(put(r,8.)) || " ");
+end;
+
+run;
+
+%end;
+  %else %do;
+
+data _null_;
+set inmem.aggr end=last;
+
+prevMaxVal = lag1(maxVal);
+
+if (_n_ = 1) then do;
+call symput("caseText", ", CASE WHEN &varname. <= " ||
+compress(put(maxVal,best9.)) || " THEN " || compress(put(r,8.)) || "
+");
+end;
+else if last then do;
+call symput("caseText", symget("caseText") || "WHEN &varname. > " ||
+compress(put(prevMaxVal,best9.)) || " THEN " || compress(put(r,8.)) ||
+" ");
+if (&firstRr. > &lastRr.) then do;
+call symput("caseText", symget("caseText") || "ELSE 1 END");
+end;
+else do;
+call symput("caseText", symget("caseText") || "ELSE " ||
+compress("&lastGroup.") || " END ");
+end;
+
+v = "z_" || compress("&varname.") || "_BLID¿©§Æ®Æ§©¿BLID";
+call symput("caseText", symget("caseText") || " as " || v);
+end;
+else do;
+call symput("caseText", symget("caseText") || "WHEN &varname. <= " ||
+compress(put(maxVal,best9.)) || " THEN " || compress(put(r,8.)) || "
+");
+end;
+run;
+   %end;
+%mend chiMergeBinner_caseText;
+
+
+
+%macro chiMergeBinner_mergechar(mergeBucket);
+proc sql undo_policy=none;
+create table inmem.aggr as
+select
+case when a.r <= &mergeBucket.+1 then a.r else a.r-1 end as r
+, a.&varname.
+, case when a.r = &mergeBucket. then compress(a.&varname.)||',
+'||compress(next.&varname.) else a.&varname. end as newval format
+$100.
+, case when a.r = &mergeBucket. then a.n + next.n else a.n end as n
+, case when a.r = &mergeBucket. then a.resp + next.resp else a.resp end as resp
+from inmem.aggr a
+left outer join inmem.aggr next on a.r + 1 = next.r
+where a.r <> &mergeBucket.+1
+;
+quit;
+
+
+data inmem.aggr;
+  set inmem.aggr(drop=&varname.);
+  rename newval = &varname.;
+run;
+%mend chiMergeBinner_mergechar;
+
+%macro chiMergeBinnerchar_step;
+
+proc sql;
+create table inmem.step as
+select
+*
+, ((this_resp - this_n*expectedRate)**2)/(this_n*expectedRate) +
+((next_resp - next_n*expectedRate)**2)/(next_n*expectedRate) as
+chiStatistics
+, 1 - probchi(calculated chiStatistics, &df.) as pValue
+from (
+select this.r as this_r
+, this.&varname. as this_minVal
+, this.&varname. as this_maxVal
+, this.n as this_n
+, this.resp as this_resp
+, this.resp/this.n as this_respRate
+, next.r as next_r
+, next.&varname. as next_minVal
+, next.&varname. as next_maxVal
+, next.n as next_n
+, next.resp as next_resp
+, next.resp/next.n as next_respRate
+
+, (this.resp+next.resp)/(this.n+next.n) as expectedRate
+from inmem.aggr this
+inner join inmem.aggr next on this.r+1 = next.r
+) t
+order by chiStatistics
+;
+quit;
+
+data inmem.step;
+set inmem.step;
+row = _n_;
+run;
+%mend chiMergeBinnerchar_step;
+
+
+
+%macro chiMergeBinner_flagText (varname, data=inmem.aggr, rank=r, n=n);
+%global flagText;
+
+proc sql noprint;
+select max(r) into :lastGroup from &data.;
+select count(distinct r) into :cardR from &data.;
+create table work.__flagTmp as select * from &data. order by minVal;
+quit;
+
+
+%let dsid = %sysfunc(open(&dsInput.));
+%if %sysfunc(vartype(&dsid.,%sysfunc(varnum(&dsid.,&varname.)))) ne N %then %do;
+
+
+
+data _null_;
+set work.__flagTmp  end=last;
+
+v = compress("z_" || compress("&varname.") || "_BLID¿©§Æ®Æ§©¿BLID" ||
+"_f" || compress(put(&rank.,8.)));
+if _n_ = 1 then do;
+call symput("flagText", ", CASE WHEN &varname. in (" ||
+compress(maxVal) || " THEN 1 ELSE 0 END as "|| v);
+end;
+else if last then do;
+call symput("flagText", trim(symget("flagText")) || ", CASE WHEN
+&varname. in " || compress(maxVal) || " THEN 1 ELSE 0 END as " || v);
+end;
+else do;
+call symput("flagText", trim(symget("flagText")) || ", CASE WHEN
+&varname. in " || compress(minVal) || " THEN 1 ELSE 0 END as " || v);
+end;
+
+
+
+run;
+
+%end;
+  %else %do;
+
+data _null_;
+set work.__flagTmp(where=(&n. ne .)) end=last;
+
+v = compress("z_" || compress("&varname.") || "_BLID¿©§Æ®Æ§©¿BLID" ||
+"_f" || compress(put(&rank.,8.)));
+
+if _n_ = 1 then do;
+call symput("flagText", ", CASE WHEN &varname. <= " ||
+compress(put(maxVal,best9.)) || " THEN 1 ELSE 0 END as " || v);
+end;
+else if last then do;
+call symput("flagText", trim(symget("flagText")) || ", CASE WHEN
+&varname. >= " || compress(put(minVal,best9.)) || " THEN 1 ELSE 0 END
+as " || v);
+end;
+else do;
+call symput("flagText", trim(symget("flagText")) || ", CASE WHEN
+&varname. between " || compress(put(minVal,best9.)) || " and " ||
+compress(put(maxVal,best9.)) || " THEN 1 ELSE 0 END as " || v);
+end;
+run;
+   %end;
+
+proc sql;
+drop table work.__flagTmp;
+quit;
+%mend chiMergeBinner_flagText;
+
+%macro chiMergeBinner_logResults (
+id
+, varname
+, targetVar
+, df
+, dsInput
+, initialGroups
+, desiredSig
+, caseStatement
+, dsCaseLog
+, logAggrData
+, aggrCopyLib
+, monoTest
+);
+* Check if the dataset for logging of case statements exists;
+%if %sysfunc(exist(&dsCaseLog.)) %then %do;
+* Do nothing;
+%end;
+%else %do;
+proc sql;
+create table &dsCaseLog. (
+id char(100)
+, varname char(100)
+, targetVar char(100)
+, df num
+, dsInput char(100)
+, initialGroups num
+, desiredSig num
+, finalGroups num
+, caseStatement char(8000)
+, monoTest char(10)
+)
+;
+quit;
+%end;
+
+* Insert the data;
+proc sql noprint;
+select max(r) into :fGroups from inmem.aggr
+;
+quit;
+
+proc sql noprint;
+insert into &dsCaseLog.
+values ("&id.", "&varname.", "&targetVar.", &df., "&dsInput.",
+&initialGroups., &desiredSig., &fGroups., "&caseStatement.",
+"&monoTest.")
+;
+quit;
+
+* Copy final dataset to another lib;
+%if (&logAggrData. = 1) %then %do;
+proc sql;
+create table &aggrCopyLib..&varname. as
+select * from inmem.aggr
+;
+quit;
+%end;
+%mend chiMergeBinner_logResults;
+
+%macro chiMergeBinner_logResults_db (
+id
+, varname
+, targetVar
+, df
+, dsInput
+, initialGroups
+, desiredSig
+, desiredGroups
+, caseStatement
+, flagStatement
+, logAggrData
+, aggrCopyLib
+, monoTest
+, projectNickname
+, variableNickname
+, iterNickname
+, minVarVal = NULL
+, maxVarVal = NULL
+);
+
+* Insert the data;
+proc sql noprint;
+select max(r) into :fGroups from inmem.aggr
+;
+quit;
+
+
+* Copy final dataset to another lib;
+%if (&logAggrData. = 1) %then %do;
+proc sql;
+create table &aggrCopyLib..&varname. as
+select "&varname." as vari format $30., * from inmem.aggr
+;
+quit;
+%end;
+
+
+proc append data= &varname. base= allresult force;
+run;
+
+%mend chiMergeBinner_logResults_db;
+
+
+%macro monotonicTest(data=, var=);
+%global monoTest;
+%global monoScore;
+%global monoDistance;
+
+proc sql noprint;
+select min(&var.)
+, max(&var.)
+, count(*)-1 into :vMin, :vMax, :vN
+from &data.
+;
+quit;
+
+%let vNstep = %sysevalf((&vMax. - &vMin.)/&vN.);
+
+data _null_;
+set &data. (where=(&var. ne .)) end=lObs;
+* sDirs will create string of movements across the rows;
+* nTrans will count the number of times the direction changes;
+* monoScore will measure how close to straight the line is;
+* monoDistance will measure how far from monotonicity the line is;
+retain nTrans 0 sDirs '            ' monoScore 0 monoDistance 0;
+
+* must only call lag once!;
+lagVar = lag(&var.);
+
+* ignore first row, otherwise test for movement direction and update sDirs;
+if _n_ > 1 then do;
+* sDirs section;
+if lagVar < &var. then sDirs = trim(sDirs)!!'U';
+else if lagVar > &var. then sDirs = trim(sDirs)!!'D';
+else sDirs = trim(sDirs)!!'F';
+
+* monoScore section;
+monoScore = monoScore + abs(1-((abs(&var.-lagVar) / &vNstep.)));
+end;
+if _n_ > 2 then do;
+if substr(sDirs,_n_-1,1) ne substr(sDirs,_n_,1) then do;
+* nTrans section;
+nTrans+1;
+
+* monoDistance section;
+monoDistance = monoDistance + (abs(&var. - lagVar) / &vMax.);
+end;
+end;
+
+* Evaluate monotonicity on last row;
+if lObs then do;
+* if first char is U, last is D and nTrans = 1 then grumpy;
+if substr(sDirs,2,1) = 'U' and substr(sDirs,_n_,1) = 'D' and nTrans =
+1 then monoTest = 'Grumpy   ';
+* if first char is D, last is U and nTrans = 1 then smiley;
+else if substr(sDirs,2,1) = 'D' and substr(sDirs,_n_,1) = 'U' and
+nTrans = 1 then monoTest = 'Smiley   ';
+* if first char is U or D and nTrans = 0 then monotonic;
+else if substr(sDirs,2,1) in ('U','D') and nTrans = 0 then monoTest =
+'Monotonic';
+* if nTrans > 1 then confused;
+else if nTrans > 1 then monoTest = 'Confused';
+* else error;
+else monoTest = 'Error';
+call symput('monoTest', monoTest);
+call symput('monoScore', put(monoScore, best.));
+call symput('monoDistance', put(monoDistance, best.));
+end;
+run;
+%mend monotonicTest;
+
+
+
+/*********************************
+
+this is the part that runs the macro, by using a macro.  This part of
+the program could take a while as it has to bin all the required
+variables!
+
+1)connect to data warehouse to get the required data
+2 Split data into build/validation.  if not done in dataset, just do
+it yourself using sample code
+
+3) Gets all of the columns that you wish to bin.
+3a) use proc contents to get all columns
+    3b) Create a new column that willl be used later to run the
+binning macro (make sure target variable and correct datset is being
+interrogated
+
+4) using the table and column in 3, a macro is created that will loop
+the total number of variables you want to investigate.
+    The macro %gloopy stops you writing out the 'binning'
+
+5) this program may provide a log error first run.  This due to these
+proc sql wanting to delete tables that have yet to be created.
+   This procedure has been added just incase the whole program needs re-running.
+
+****/
+
+
+
+options compress=yes;
+
+%let targetvar=bad;
+
+data build valid;
+  format sampleallocation $15.;
+  set rej.kgb1;
+  sampleallocation='Build';
+  if &targetvar=1 and ranuni(7)<=.7 then output build;
+  if &targetvar=0 and ranuni(7)<=.7 then output build;
+
+  sampleallocation='Validation';
+  if &targetvar=1 and ranuni(7)>0.7 then output valid;
+  if &targetvar=0 and ranuni(7)>.7 then output valid;
+run;
+
+proc contents data=build out=cols(keep=name type format);
+run;
+
+
+/** remove the fields you do not want binning e.g. acountid, target
+variables etc..*/
+
+data colsa;
+  set cols;
+   if name not in ('lOAN_HISTORY_ID' 'lhAPPLICATION_DATE_TIME'  'bad');
+   leng = length(name);
+run;
+
+proc sort data= colsa;
+  by descending leng;
+run;
+
+/** make sure that the data table and target variable is correct! */
+
+data cols1;
+  format maccy $350.;
+  set colsa;
+  n+1;
+  maccy =compress('%'||'chiMergeBinner2(id=lOAN_HISTORY_ID,
+varname='||compress(name)||
+",targetVar=&targetvar.
+,df          =1
+,dsInput        =build
+,initialGroups    =   100
+,desiredSig      = .01
+,desiredBins       =0"||
+', aggrCopyLib      =work
+,dsCaseLog         =caselog
+,dsExceptions      =
+,projectNickname   = aluntest
+,variableNickname  =jeff
+,iterNickname      = keith
+,minVarVal         = NULL
+,maxVarVal         = NULL);');
+
+  call symput('finny', n);
+run;
+
+
+proc sql;
+drop table allres;
+drop table allresult;
+drop table yum;
+        drop table inmem.cordata;
+drop table inmem.bin_reject;
+quit;
+
+options nomprint nomlogic;
+%macro gloopy;
+%do i=1 %to &finny;
+
+data yum;
+  set cols1;
+  if n= &i. ;
+  call symput("funky", maccy);
+run;
+&funky;
+
+%end;
+%mend;
+
+
+/* Print the log to the specified location */
+proc printto log=work.LOGgy;
+run;
+
+
+options mlogic mprint;
+%gloopy;
+
+
+proc sql;
+drop table yum;
+drop table nully;
+drop table tmp;
+drop table tmp1;
+drop table tmp2;
+drop table tmp3;
+drop table maxr;
+quit;
+
+/* Turn off printing to the file */
+proc printto;
+run;
+
+
+/*this part of the program tries to make all variables monotonic
+
+1) gets all variables that are monnotonic and stores them safely away...
+
+2) using smiley grumpy and confused make sure there are a minimim 1000
+observations in each bin
+   2a) creates new tests
+   2a) removes all new monotonic
+   2b) all smilety and grumoy are created as 2  variables
+3) the remainder are then havig bins combined by
+a) cumulative target rate
+b) then binned by distinct target rates
+4a) all monotonic from 3b are then extratced
+4b) the remainder are left out and put in reject bin
+4c null rejection.  If numerial variable and nulls are not at end
+(beginning or last) then remove
+
+5)next stage calculated the woe and IV and gini/Somers D' of each variable
+any variables with 2 or less bins with a low IV are rejected
+
+6) the build and validation datset is then binned based on the work
+carried out above using a macro called  looly;   (as the name loopy
+has been taken)
+    this part also puts the woe figures into the dataset ready for model build.
+    output datsets are called BUILDX and VALIDX
+
+
+7) A macro called corr_red is then used
+   a)picks the first variable (alphabetically)
+   b) locates all of thos evariable that are correltated with it
+   d) chooses the strongest variable by IV
+   e) removes all the variables it was correlated with from the list
+and puts them in  'rejection file' while keeping the one variable that
+was predictive
+       (correltaion limit is set at 0.9... this can be chnaged as part of macro)
+
+   7f the rejected variables are detailed reasons why
+
+
+
+8) final dataset is left that details the final variables that should
+be considered for model (inmem.varuse0_9)
+**/
+%let targetvar=bad;
+
+
+proc sort data= inmem.cordata nodupkey;
+  by vari r;
+run;
+
+data cor;
+  set inmem.cordata;
+run;
+
+proc freq data= cor;
+  table monotest;
+run;
+
+data monotonic;
+  set cor;
+  if monotest = 'Monotonic';
+run;
+
+/** sort out confused smily grumpy
+1) by first makinf sure they all have a minimum 1000 observtions in
+each pot (discovered quite a few can be fixed using this
+2) any left force try and make as many of them  smile/grumpy
+3) any left, make it monontonic
+
+*/
+
+
+
+/** minimum 1000 bins**/
+
+data conf confnull;
+   set cor;
+  if monotest in ('Confused' 'Smiley' 'Grumpy') and r>=1 then output conf;
+  if monotest in ('Confused' 'Smiley' 'Grumpy') and r=0 then output confnull;
+run;
+
+/** first of all sort out small bins  **/
+
+data conf1;
+  set conf(keep=vari minval maxval r n numnull totn resp totresp maxr);
+  n1000=( n>1000);
+run;
+
+
+data conf2;
+  set conf1;
+  by vari ;
+  if first.vari then cumn = 0;
+  cumn = cumn + n1000;
+  retain cumn;
+   mival = input(put(minval, $12.), best12.);
+  maval = input(put(maxval, $12.), best12.);
+run;
+
+data conf2a;
+  set conf2;
+  by vari;
+  if first.vari and cumn=0 then cumn=1;
+run;
+
+
+proc summary data= conf2a nway;
+   class vari totn totresp  numnull cumn;
+   var mival maval n resp ;
+   output out= conf3(drop=_type_ _freq_)
+    min(mival) = minvala
+     max(maval r)= maxvala maxr
+sum(n resp) = ;
+run;
+
+
+data conf4;
+  set conf3;
+  resprate = resp / n;
+  lagresp = lag(resprate);
+run;
+
+data conf5;
+  set conf4;
+    by vari;
+down=0; up=0; same=0;
+if first.vari then do;
+   down=0; up=0; same=0;
+  end;
+
+  else if lagresp>resprate then  down=1;
+  else if lagresp<resprate then up=1;
+  else if lagresp=resprate then same=1;
+run;
+
+
+data conf5a;
+  set conf5(keep=vari down up same);
+  by vari;
+  if vari=olvari and down=oldown and up=olup then delete;
+  olup=up;
+  oldown=down;
+  olvari=vari;
+  retain olup oldown olvari;
+run;
+
+
+proc summary data= conf5a nway;
+  class vari;
+  var down up same;
+  output out= conf6(drop=_type_ ) sum=;
+run;
+
+
+data confmon smilgrump other;
+  set conf6;
+  if sum(down, up, same)=0 or down=0 or up=0  then output confmon;
+  else if up<=1 and down<=1 then output smilgrump;
+  else output other;
+run;
+
+data confmon1(keep=vari minval maxval r n resp resprate numnull totn totresp);
+  format minval maxval $100.;
+  merge confmon(keep=vari in=a)
+        conf4( rename=(cumn = r ));
+by vari;
+  if a;
+  minval = input(put(minvala,best12.), $12.);
+  maxval = input(put(maxvala,best12.), $12.);
+run;
+
+data confnull1(keep=vari minval maxval r n resp resprate numnull totn totresp);
+  merge confnull
+        confmon(keep=vari in=a);
+by vari;
+  if a;
+run;
+
+data newmon;
+  set confmon1
+       confnull1;
+run;
+
+proc sort data= newmon;
+  by vari r;
+run;
+
+
+
+/** sort out grumpy and smiley
+  names are given by graph shapes  **/
+
+proc summary data= conf5 nway;
+  class vari;
+  var down up;
+  output out=tog(drop=_type_) sum=;
+run;
+
+data smilgrump1;
+  merge smilgrump( in=a)
+          conf4(drop=maxr)
+  tog(rename=(_freq_=maxr down=totd up=totup));
+    by vari;
+  if a;
+run;
+
+data smilg(keep= vari monotest);
+  format monotest $10.;
+  set smilgrump1;
+  if maxr=3 then do;
+  if  cumn=2 and resprate>lagresp then monotest='Grumpy';
+  if  cumn=2 and resprate<lagresp then monotest='Smiley';
+  end;
+  else if maxr>=4 then do;
+    if totup>totd then monotest='Smiley';
+else monotest='Grumpy';
+  end;
+  if monotest^=' ';
+run;
+
+proc sort data= smilg nodupkeys;
+  by vari;
+run;
+
+data smilgrump2;
+  merge smilgrump1( in=a)
+        smilg;
+    by vari;
+  if a;
+run;
+
+data r3;
+  set smilgrump2;
+  if maxr=3;
+run;
+
+proc sort data= r3;
+  by vari resprate;
+run;
+
+data r3a;
+  set r3;
+  by vari;
+  if first.vari then nummy=0;
+  nummy = nummy + 1;
+  retain nummy;
+run;
+
+data fix leaveit;
+  set r3a;
+  if (monotest='Smiley' and nummy in (1,2)) or
+      (monotest='Grumpy' and nummy in (2,3)) then output fix;
+else output leaveit;
+run;
+
+proc summary data= fix nway;
+   class vari totn totresp monotest numnull;
+   var minvala maxvala n resp ;
+   output out= fix1(drop=_type_ )
+    min(minvala) = minvala
+     max(maxvala )= maxvala
+sum(n resp ) = ;
+run;
+
+data fix2(drop=  maxr);
+  format minval maxval $100.;
+  set fix1(rename=(_freq_ = maxr ));
+  minval = input(put(minvala,best12.), $12.);
+  maxval = input(put(maxvala,best12.), $12.);
+  resprate = resp / n;
+  if  maxr = 3 then r=3;
+    else r=1;
+run;
+
+data fix3(drop= minvala maxr);;
+ format minval maxval $100.;
+  set leaveit
+       fix2;
+  maxr=2;
+  minval = input(put(minvala,best12.), $12.);
+  maxval = input(put(maxvala,best12.), $12.);
+
+run;
+
+proc sort data=fix3;
+  by vari maxvala;
+run;
+
+data fix3a;
+  set fix3(drop=r);
+  by vari;
+  if first.vari then r=0;
+  r = r + 1;
+  retain r;
+run;
+
+data fixnull(keep=vari minval maxval r n resp resprate numnull totn totresp);
+  merge confnull
+        fix2(keep=vari in=a);
+by vari;
+  if a and first.vari and n>0;
+run;
+
+data newmon1(keep=vari minval maxval r n resp resprate numnull totn totresp);
+  set fix3a
+       fixnull;
+run;
+
+proc sort data= newmon1;
+  by vari r;
+run;
+
+
+/*** do smiley grumpy into 2 variables  **/
+
+
+
+data r4;
+  set smilgrump2(rename=(cumn=r));
+  if maxr>3;
+run;
+
+proc sort data=r4;
+  by vari resprate;
+run;
+
+data r4a(keep=vari nook);
+  set r4(keep=vari n maxr monotest r);
+  by vari;
+  if (first.vari and monotest='Smiley') or (last.vari and monotest='Grumpy');
+  nook=r;
+run;
+
+data r4b;
+  merge r4
+        r4a;
+by vari;
+run;
+
+
+data r4c;
+  format vari $16. minval maxval $100.;
+  set r4b(rename=(vari=varx));
+  if nook<=3 then do;
+     if nook=3 and r<=2 and maxr =4 then vari=compress(varx||'xx');
+       else if nook=3 and r>2 and maxr =4 then vari=compress(varx||'yy');
+       else if r<=nook then  vari=compress(varx||'xx');
+       else vari=compress(varx||'yy');
+end;
+  else  do;
+     if (maxr - nook) =1 and r>=nook then vari=compress(varx||'yy');
+       else if r<=nook then  vari=compress(varx||'xx');
+       else vari=compress(varx||'yy');
+end;
+
+  minval = input(put(minvala,best12.), $12.);
+  maxval = input(put(maxvala,best12.), $12.);
+run;
+
+
+
+
+/** add in nulls  **/
+
+proc summary data= r4c nway;
+  class vari varx totn totresp;
+  var n resp;
+  output out=nulsmil(drop=_type_ _freq_) sum=;
+run;
+
+data nulsmil1;
+  set nulsmil(rename=(n=xn resp=xresp));
+  n = totn - xn;
+  resp = totresp - xresp;
+  reprate = resp / n;
+  minval = 'null';
+  maxval = 'null';
+  r=0;
+  numnull = n;
+run;
+
+data smilgrump(keep=vari varx minval maxval r n resp resprate numnull
+totn totresp);
+  set r4c nulsmil1;
+  resprate = resp / n;
+run;
+
+
+proc sort data=smilgrump;
+  by vari r;
+run;
+
+
+/**shit bins for monotonic */
+
+
+/** the rest  **/
+
+data vars(keep=vari varx minval maxval r n resp resprate numnull totn
+totresp boom);
+  set monotonic newmon newmon1 smilgrump;
+  if varx = ' ' then boom = vari;
+    else boom=varx;
+run;
+
+proc sort data= vars out=vars1(keep=boom) nodupkeys;
+  by boom;
+run;
+
+data crap(rename=(boom=vari));
+  merge vars1(keep=boom in=a)
+         conf4(rename=(vari=boom) in=b);
+    by boom;
+  if b and not a;
+run;
+
+
+
+data crap1(drop=lagresp);
+ set crap;
+ by vari;
+ if first.vari then do;
+   cumnum = 0;
+   cumresp=0;
+  end;
+  cumnum = cumnum + n;
+  cumresp = cumresp + resp;
+  retain cumnum cumresp;
+run;
+
+data crap2;
+  set crap1;
+  cumresprate = cumresp / cumnum;
+  lagcum = lag(cumresprate);
+run;
+
+
+
+data crap3;
+  set crap2;
+   by vari;
+down=0; up=0; same=0;
+if first.vari then do;
+   down=0; up=0; same=0;
+  end;
+
+  else if lagcum>cumresprate then  down=1;
+  else if lagcum<cumresprate then up=1;
+  else if lagcum=cumresprate then same=1;
+
+  if first.vari then diff=0;
+  else diff= cumresprate - lagcum;
+run;
+
+
+
+data crap4;
+  set crap3(keep=vari down up same lagcum cumn diff);
+  by vari;
+  if vari=olvari and down=oldown and up=olup then delete;
+  olup=up;
+  oldown=down;
+  olvari=vari;
+  retain olup oldown olvari;
+run;
+
+data crap5(keep=vari cumn bok);
+  set crap4;
+  if (diff<0.02 and diff>=-0.02) and cumn>=3;
+  bok=cumn;
+run;
+
+data crap6;
+  merge crap2(in=a)
+        crap5;
+by vari cumn;
+  if a;
+
+run;
+
+data crap7;
+  set crap6;
+  boka=lag(bok);
+  diff = boka - bok;
+run;
+
+data crap8;
+  set crap7;
+  by vari;
+  if first.vari then nummy=0;
+  nummy = nummy + min(0,diff) + 1;
+  retain nummy;
+run;
+
+data crap9;
+  set crap8;
+  if bok>0 then nummy = nummy-1;
+run;
+
+proc summary data= crap9 nway;
+   class vari nummy totn totresp;
+   var minvala maxvala n resp ;
+   output out= crap10(drop=_type_ )
+    min(minvala) = minvala
+     max(maxvala )= maxvala
+sum(n resp ) = ;
+run;
+
+data crap11;
+  set crap10;
+  by vari;
+  if first.vari then r=0;
+  r = r + 1;
+  retain r;
+  resprate = resp / n;
+run;
+
+/** now make sure binshave good separation  **/
+
+data crap12(keep=vari r bok diff resprate);
+  set crap11;
+   diff = lag(resprate) - resprate;
+
+  if (diff<0.05 and diff>=-0.05) and r>=2;
+  bok=r;
+run;
+
+data crap13;
+  merge crap11(in=a)
+        crap12;
+by vari r;
+  if a;
+
+run;
+
+data crap14;
+  set crap13;
+  boka=lag(bok);
+  diff = boka - bok;
+run;
+
+data crap15;
+  set crap14(drop=nummy);
+  by vari;
+  if first.vari then nummy=0;
+  nummy = nummy + min(0,diff) + 1;
+  retain nummy;
+run;
+
+data crap16;
+  set crap15;
+  if bok>0 then nummy = nummy-1;
+run;
+
+proc summary data= crap16 nway;
+   class vari nummy totn totresp;
+   var minvala maxvala n resp ;
+   output out= crap17(drop=_type_ )
+    min(minvala) = minvala
+     max(maxvala )= maxvala
+sum(n resp ) = ;
+run;
+
+data crap18;
+  set crap17;
+  by vari;
+  if first.vari then r=0;
+  r = r + 1;
+  retain r;
+  resprate = resp / n;
+run;
+
+
+data crap19;
+  set crap18(keep=vari r);
+  by vari;
+  if last.vari;
+run;
+
+data crap20;
+  merge crap19(rename=(r=maxr))
+        crap18;
+     by vari;
+  lagresp = lag(resprate);
+run;
+
+/** only keep monotastic ones  **/
+
+
+data crap21;
+  set crap20;
+    by vari;
+down=0; up=0; same=0;
+if first.vari then do;
+   down=0; up=0; same=0;
+  end;
+
+  else if lagresp>resprate then  down=1;
+  else if lagresp<resprate then up=1;
+  else if lagresp=resprate then same=1;
+run;
+
+
+data crap21a;
+  set crap21(keep=vari down up same);
+  by vari;
+  if vari=olvari and down=oldown and up=olup then delete;
+  olup=up;
+  oldown=down;
+  olvari=vari;
+  retain olup oldown olvari;
+run;
+
+
+proc summary data= crap21a nway;
+  class vari;
+  var down up same;
+  output out= crap22(drop=_type_ ) sum=;
+run;
+
+
+data crapmon crapnomon;
+  set crap22;
+  if sum(down, up, same)=0 or down=0 or up=0  then output crapmon;
+     else output crapnomon;
+run;
+
+
+data crapmon1(drop=lagresp _freq_ minvala maxvala);
+  format minval maxval $100.;
+  merge crapmon(keep=vari in=a)
+         crap20;
+by vari;
+  if a;
+   minval = input(put(minvala,best12.), $12.);
+  maxval = input(put(maxvala,best12.), $12.);
+run;
+
+data crapnull;
+  merge crapmon(keep=vari in=a)
+         confnull;
+by vari;
+  if a and n>0;
+run;
+
+data crapmon2(keep=vari minval maxval r n resp resprate numnull totn totresp);
+  set crapmon1
+      crapnull;
+
+run;
+
+
+data monotonicreject;
+  set crapnomon(keep=vari);
+  format mon_reas $200.;
+  mon_reas = 'Could not bin to be monotonic ';
+run;
+
+data inmem.allvars(drop=boom);
+  set vars crapmon2;
+run;
+
+proc sort data= inmem.allvars;
+  by vari r;
+  where n>0;
+run;
+
+
+proc sql;
+  drop table crap1;
+  drop table crap2;
+  drop table crap3;
+  drop table crap4;
+  drop table crap5;
+  drop table crap6;
+  drop table crap7;
+  drop table crap8;
+  drop table crap9;
+  drop table crap10;
+  drop table crap11;
+  drop table crap12;
+  drop table crap13;
+  drop table crap14;
+  drop table crap15;
+  drop table crap16;
+  drop table crap17;
+  drop table crap18;
+  drop table crap19;
+  drop table crap20;
+  drop table crap21;
+  drop table crap21a;
+  drop table crap22;
+
+  drop table work.conf;
+  drop table work.confnull;
+  drop table work.conf1;
+  drop table work.conf2;
+  drop table work.conf3;
+  drop table work.conf4;
+  drop table work.conf5;
+  drop table work.conf6;
+  drop table work.conf2a;
+  drop table work.conf5a;
+  drop table work.confmon;
+  drop table work.smilgrump;
+  drop table work.smilgrump1;
+  drop table work.smilgrump2;
+  drop table work.other;
+  drop table work.newmon;
+  drop table work.tog;
+  drop table work.smilg;
+  drop table work.r3;
+  drop table work.r3a;
+  drop table work.fix;
+  drop table work.leaveit;
+  drop table work.fix1;
+  drop table work.fix2;
+  drop table work.fix3;
+  drop table work.fix3a;
+  drop table work.fixnull;
+  drop table work.newmon1;
+  drop table work.r4;
+  drop table work.r4a;
+  drop table work.r4b;
+  drop table work.r4c;
+  drop table work.nulsmil;
+  drop table work.nulsmil1;
+  drop table work.vars;
+  drop table work.vars1;
+  drop table work.crapmon;
+  drop table work.crapnomon;
+  drop table work.crapmon1;
+  drop table work.crapnull;
+  drop table work.crapmon2;
+quit;
+
+
+/** carry out null test here as maybe reducing correlated variables
+  based on null not being in correct plsce **/
+
+
+proc sort data= inmem.allvars ;
+by vari ;
+run;
+
+proc sort data= inmem.allvars  out= nullsxx(keep=vari);
+by vari;
+where numnull>0;
+run;
+
+data nonull  nulls;
+  merge inmem.allvars(in=a)
+        nullsxx(in=b);
+by vari;
+  if a and b then output nulls;
+  else output nonull;
+run;
+
+proc sort data=nulls;
+  by vari resprate;
+run;
+
+data nulls1;
+  set nulls;
+  by vari;
+  if first.vari and numnull>0 or last.vari and numnull>0;
+run;
+
+data varsok(keep=vari);
+  set nonull nulls1;
+run;
+
+proc sort data=varsok nodupkey;
+  by vari;
+run;
+
+
+proc contents data=build(obs=1) out=conts(keep=name format) noprint;
+run;
+
+proc sort data= conts;
+  by name;
+run;
+
+data nullrej;
+  merge  varsok(in=b)
+         inmem.allvars(in=a)
+         conts(rename=(name=vari));
+by vari;
+  if a and not b and format=' ';
+run;
+
+proc sort data=nullrej out= nullrej1(keep=vari) nodupkeys;
+  by vari;
+run;
+
+data allvars1;
+  merge  nullrej1(in=b)
+         inmem.allvars(in=a);
+by vari;
+  if a and not b;
+  if numnull=. then numnull=0;
+run;
+
+data inmem.allvars;
+  set allvars1;
+run;
+
+
+data cor;
+  format code bincode $500.;
+  set inmem.allvars;
+  by vari;
+
+if vari not in ('HCB' 'ICB'); /** some variables cause issues so need
+to be removed from here **/
+  if varx= ' ' then  varx=vari;
+
+
+WOE = log(( resp/ totresp) / ((n-resp) / (totn -totresp)));
+IVContribution = ((resp / totresp) - ((n-resp) / (totn - totresp))  ) * WOE;
+  if first.vari then numb=1; else numb=0;
+
+
+
+
+    /** put in bins  **/
+   if left(substr(minval,1,1)) ^='"' then do;
+  if minval='null' then bincode ="if "||compress(vari)||"=. then
+"||compress(vari)||"bin='null';";
+          else bincode ="if "||compress(vari)||">="||
+compress(minval)||" and "||compress(vari)||"<="||compress(maxval)||"
+then "||compress(vari)||"bin='"||compress(minval)||" to
+"||compress(maxval)||"';";
+end;
+  if left(substr(minval,1,1)) ='"' then do;
+          bincode = "if "||compress(vari)||" in ("||
+compress(minval)||") then
+"||compress(vari)||"bin='"||compress(minval)||"';";
+  end;
+
+    if substr(left(reverse(vari)),1,2) in ('xx' 'yy') and vari^=varx
+and left(substr(minval,1,1)) ^='"' then do;
+  if minval='null' then bincode ="if "||compress(vari)||"=. then
+"||compress(vari)||"bin='null';";
+          else bincode ="if "||compress(varx)||">="||
+compress(minval)||" and "||compress(varx)||"<="||compress(maxval)||"
+then "||compress(vari)||"bin='"||compress(minval)||" to
+"||compress(maxval)||"';";
+end;
+
+
+
+
+  /** put in woe  **/
+
+   if left(substr(minval,1,1)) ^='"' then do;
+      if minval='null' then minval=.;
+  if maxval='null' then maxval=.;
+          code ="if "||compress(vari)||">="|| compress(minval)||" and
+"||compress(vari)||"<="||compress(maxval)||" then
+"||compress(vari)||"a="||woe||";";
+end;
+  if left(substr(minval,1,1)) ='"' then do;
+          code = "if "||compress(vari)||" in ("|| compress(minval)||")
+then "||compress(vari)||"a="||woe||";";
+  end;
+
+  retain y;
+  y = sum(numb, y);
+  atendy = (int(y/100))+1;
+
+  call symput('endy', y);
+  call symput('atendy', atendy);
+
+run;
+
+
+proc reg data=cor outest=rsq noprint;
+  by y;
+  model r=woe / rsquare;
+  where r>=1 and woe^=.;
+run;
+
+proc summary data= cor nway;
+  class y;
+  var IVContribution;
+  output out=iv(drop=_type_ ) sum=;
+run;
+
+
+
+proc logistic data=cor descending noprint;
+  by y;
+  model resp / n = woe ;
+  output out=outy p=prd;
+run;
+
+data event nonevent;
+  set outy;
+  pbin=floor((1/0.002)*prd); /** this is the SAS method of creating pbin  */
+  good = n - resp;
+  bad=resp;
+run;
+
+proc sql;
+  create table pairs1 as
+  select a.y, a.pbin as pbin1, b.pbin as pbin2,
+              a.bad as bad1, b.bad as bad2,
+            a.good as good1, b.good as good2
+   from event a  join nonevent b
+   on a.y=b.y;
+quit;
+
+data pairs2;
+  set pairs1;
+  conc=0;
+  disc=0;
+  tied=0;
+
+  if pbin1>pbin2 then conc= bad1 * good2;
+  else if pbin1<pbin2 then disc= bad1 * good2;
+  else tied= bad1 * good2;
+run;
+
+proc summary data=pairs2 nway;
+  class y;
+  var conc disc tied;
+  output out=pairs3 mean=propconc propdisc proptie sum=nc nd tied n=t;
+run;
+
+
+data pairs4;
+  set pairs3;
+  conc = nc / (nc + nd + tied);
+  disconc =nd / (nc + nd + tied);
+  tidy = tied / (nc + nd + tied);
+
+  somersd = (conc - disconc) / (conc + disconc + tidy);
+run;
+
+data cor1;
+  format varibin $32.;
+  merge cor(in=a)
+         rsq(keep=_rsq_ y)
+          iv(rename=(IVContribution=iv _freq_ = maxr))
+          pairs4(keep=y somersd);
+by y;
+if a;
+  if _rsq_=. then _rsq_=0;
+  varibin = compress(vari||'bin');
+run;
+
+
+
+%put &endy;
+%put &atendy;
+
+%macro looly;
+
+proc sql;
+drop table cor2;
+quit;
+%global  corvarx;
+%do k = 1 %to &atendy;
+
+  %do i = %eval((100 * (&k. -1)) + 1) %to %eval(%sysfunc(min(
+%eval(100 * &k.) , &endy.)));
+%global bok;
+
+data cor2;
+  set cor1;
+  if y = &i;
+  varibin = compress(vari||'bin');
+  call symput('bok', vari);
+  call symput('bokbin', varibin);
+run;
+
+proc sql noprint;
+  select code into:&bok. separated by ' '
+  from cor2;
+quit;
+
+
+proc sql noprint;
+  select bincode into:&bokbin. separated by ' '
+  from cor2;
+quit;
+
+  %end;
+
+proc sql noprint;
+  select distinct compress("&"||vari||".;") into:codeme_&k. separated by ' '
+  from cor1
+  where y>= %eval((100 * (&k. -1)) + 1) and y<=%eval(%sysfunc(min(
+%eval(100 * &k.) , &endy.)));
+quit;
+
+
+proc sql noprint;
+  select distinct compress("&"||varibin||".;") into:codebin_&k. separated by ' '
+  from cor1
+  where y>= %eval((100 * (&k. -1)) + 1) and y<=%eval(%sysfunc(min(
+%eval(100 * &k.) , &endy.)));
+quit;
+
+
+proc sql noprint;
+  select distinct compress(vari||"a ") into:corvar_&k. separated by ' '
+  from cor1
+  where y>= %eval((100 * (&k. -1)) + 1) and y<=%eval(%sysfunc(min(
+%eval(100 * &k.) , &endy.)));
+quit;
+
+
+proc sql noprint;
+  select distinct compress(varibin) into:corbin_&k. separated by ' '
+  from cor1
+  where y>= %eval((100 * (&k. -1)) + 1) and y<=%eval(%sysfunc(min(
+%eval(100 * &k.) , &endy.)));
+quit;
+
+%end;
+
+
+data foxy;
+  do p = 1 to &atendy;
+  output;
+  end;
+run;
+
+data foxy1;
+  format codex $12.;
+  set foxy;
+  codex = compress('&'||'codeme_'||p||'.;');
+  codebinx = compress('&'||'codebin_'||p||'.;');
+  corvar = compress('&'||'corvar_'||p||'. ');
+  corbinx = compress('&'||'corbin_'||p||'. ');
+
+run;
+
+
+proc sql noprint;
+  select  codex into:codeme separated by ' '
+  from foxy1;
+quit;
+
+
+proc sql noprint;
+  select  codebinx into:codebin separated by ' '
+  from foxy1;
+quit;
+
+proc sql noprint;
+  select  corvar into:corvarx separated by ' '
+  from foxy1;
+quit;
+
+
+proc sql noprint;
+  select  corbinx into:corbinx separated by ' '
+  from foxy1;
+quit;
+
+data buildx;
+  format &corbinx. $50.;
+  set build;
+  &codeme.;
+
+  &codebin.;
+RUN;
+
+data validx;
+  format &corbinx. $50.;
+  set valid;
+  &codeme;
+  &codebin.;
+run;
+
+
+
+/** also reject pot */
+
+
+
+data rejpop;
+  format &corbinx. $50.;
+  set rej.rejpop1;
+  &codeme;
+  &codebin.;
+run;
+
+
+
+proc corr data= buildx outp= corr4 noprint;
+var &corvarx;
+run;
+
+%mend;
+
+%looly;
+
+
+
+
+proc sql;
+  create table bins as
+  select distinct compress(vari||'a') as _name_, _rsq_,
+          maxr as bins, sum(ivcontribution) as iv
+  from cor1
+  group by compress(vari||'a'),  maxr, _rsq_;
+  quit;
+
+  proc sql;
+  create table corr5 as
+  select  bins,  iv, _rsq_ as rsquare, a.*
+  from corr4 a left join bins b
+  on a._name_= b._name_;
+quit;
+
+
+proc contents data=build(obs=1) out=conts(keep=name format) noprint;
+run;
+
+proc sql;
+  create table corr6 as
+  select case when b.format ='$' then 'char' else 'num' end as
+var_format, b.name as vari, a.*
+  from corr5 a left join conts b
+  on a._name_ = compress(b.name||'a')
+  where _type_ not in ('N' 'MEAN' 'STD') and iv>0;
+quit;
+
+data corrie;
+  format monotest $12.;
+  set corr6;
+   monotest = 'Monotonic';
+   if vari=' ' then vari = substr(_name_,1,length(_name_)-1);
+
+run;
+
+
+
+*** start macro from here **;
+
+
+%macro corr_red(cor_limit);
+
+proc printto log=work.LOGx;
+run;
+
+data _null_;
+  x = input(put(&cor_limit. ,best9.), $9.);
+  y=tranwrd(x,'.','_');
+  call symput('hug', y);
+run;
+
+proc sql;
+drop table varuse;
+drop table use;
+drop table histy;
+drop table histy&hug.;
+drop table varuse&hug.;
+drop table corr_reject&hug.;
+quit;
+
+
+%let bom=500;
+
+%do %while (&bom. >=1);
+
+data _null_;
+  set corrie;
+  if _n_ =1;
+  call symput('vark', _name_);
+run;
+
+proc sort data= corrie(keep=bins monotest iv &vark _name_ var_format
+vari rsquare) out=cormax;
+  by descending iv;
+  where (&vark.>=&cor_limit. or &vark.<=-&cor_limit.);
+run;
+
+data _null_;
+  set cormax;
+  if _n_ =1;
+  call symput('maxiv', iv);
+run;
+
+data corrie1;
+  set cormax;
+  if  (&vark.>=&cor_limit. or &vark.<=&cor_limit.);
+  if monotest = 'Monotonic' then mon=1;
+  else if rsquare>0.8 then mon=2;
+  else if rsquare>0.6 then mon=3;
+  else if rsquare>0.4 then mon=4;
+    else mon=5;
+
+  if var_format='num' then form=1; else form=2;
+  ivrank = int((int((&maxiv. +0.005) *1000) - int(iv *1000))/10);
+run;
+
+proc sort data= corrie1;
+  by mon ivrank  form descending iv;
+run;
+
+data rej use(drop=&vark);
+  set corrie1;
+  if _n_ =1 then output use;
+    else output rej;
+run;
+
+proc append data=use base=varuse&hug. force;
+run;
+
+proc sql noprint;
+  select  vari, mon, form, ivrank into :usevar, :monot, :formy, :ivrank
+  from use;
+quit;
+
+data rej1(keep=vari reason);
+  set rej;
+  format  mon_reas $20. othreas ivreas $25. formreas $30. reason $250.;
+  if  mon>&monot.     then mon_reas = 'Not as monotonic ';
+  if ivrank>&ivrank. then ivreas = 'Not as predictive ';
+  if form> &formy then formreas = 'variable is characteristic ';
+  if mon_reas=' ' and ivreas=' ' and formreas=' ' then othreas = 'Not
+predictive enough';
+  reason =  'Variable is correlated with '||compress("&usevar.")||' on
+'||compress("&cor_limit.") ||' criteria but fails due to:
+'||left(mon_reas||ivreas||formreas||othreas);
+
+run;
+
+
+proc append data=rej1 base=corr_reject&hug. force;
+run;
+
+proc sql noprint;
+  select  compress(quote(_name_)), _name_  into :delv separated by ',
+' , :delva separated by ' '
+  from corrie1;
+quit;
+
+
+proc sql noprint;
+  select  sum(1) into :toty
+  from corrie1;
+quit;
+
+data corrie;
+  set corrie;
+  drop &delva.;
+  if _name_ not in (&delv.);
+run;
+
+proc sql noprint;
+  select count(*) into :bom
+  from corrie;
+quit;
+
+data hist;
+vars = &bom.;
+drop = &toty.;
+run;
+
+proc append data=hist base=histy&hug. force;
+run;
+
+
+%end;
+
+proc sql;
+drop table hist;
+drop table rej1;
+drop table rej;
+drop table use;
+drop table corrie;
+drop table corrie1;
+drop table cormax;
+drop table use;
+
+
+proc printto;
+run;
+%mend;
+
+%corr_red(0.9);
+
+
+
+proc sort data= varuse0_9;
+  by descending iv;
+run;
+
+data varuse1;
+  set varuse0_9;
+  if substr(left(reverse(vari)),1,2) in ('xx' 'yy') then
+     var = substr(vari,1,(length(vari)-2));
+else var=vari;
+run;
+
+proc sql;
+  create table inmem.varuse0_9 as
+  select a.vari, descr, bins, iv, var_format, _name_, form
+  from varuse1 a left join callcredit b
+  on a.var=b.code
+  order by  iv desc;
+quit;
